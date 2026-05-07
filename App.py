@@ -319,6 +319,16 @@ def get_status(job_id):
         "error": job.get("error"),
     })
 
+import subprocess
+
+@app.route("/ffmpeg")
+def ffmpeg_test():
+    try:
+        return subprocess.check_output(
+            ["ffmpeg", "-version"]
+        ).decode()
+    except Exception as e:
+        return str(e)
 
 # ─── DOWNLOAD trigger (same as /info without metadata) ───────────────
 @app.route("/download", methods=["POST"])
