@@ -30,9 +30,23 @@ def cleanup_old_files():
                         os.remove(filepath)
                     except:
                         pass
-                del jobs[job_id]
+                try:
+                    del jobs[job_id]
+                except:
+                    pass
 
 threading.Thread(target=cleanup_old_files, daemon=True).start()
+
+
+# ─── Format priority list (best se worst tak) ────────────────────────
+FORMAT_PRIORITY = [
+    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
+    "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]",
+    "bestvideo+bestaudio/best",
+    "best[acodec!=none][vcodec!=none]",
+    "best[ext=mp4]",
+    "best",
+]
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────
@@ -44,56 +58,103 @@ def extract_thumbnail(info):
     return thumbnail
 
 
-def extract_video_url(info):
-    formats = info.get("formats", [])
-
-    for f in formats:
-        if (
-            f.get("ext") == "mp4"
-            and f.get("vcodec") != "none"
-            and f.get("acodec") != "none"
-            and f.get("url")
-        ):
-            return f["url"]
-
-    for f in formats:
-        if f.get("url"):
-            return f["url"]
-
-    return info.get("url", "")
+# ─── URL cache (same URL dobara download na ho) ──────────────────────
+url_cache = {}
+url_cache_lock = threading.Lock()
 
 
-# ─── Background download ─────────────────────────────────────────────
-def download_reel(job_id: str, url: str):
-    jobs[job_id]["status"] = "downloading"
-
+# ─── Server-side merge ───────────────────────────────────────────────
+def merge_and_cache(job_id: str, url: str):
+    """
+    yt_dlp + ffmpeg se video+audio merge karke server pe save karo.
+    FORMAT_PRIORITY list waterfall: pehla jo kaam kare use karo.
+    """
+    jobs[job_id]["status"] = "processing"
     output_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
+    last_error = "No format worked"
 
-    try:
-        with yt_dlp.YoutubeDL({
-            "outtmpl": output_template,
-            "format": "best[ext=mp4]/best",
-            "quiet": True,
-            "no_warnings": True,
-        }) as ydl:
-            info = ydl.extract_info(url, download=True)
+    for fmt in FORMAT_PRIORITY:
+        try:
+            ydl_opts = {
+                "outtmpl": output_template,
+                "format": fmt,
+                "merge_output_format": "mp4",
+                "quiet": True,
+                "no_warnings": True,
+                "postprocessors": [
+                    {
+                        "key": "FFmpegVideoConvertor",
+                        "preferedformat": "mp4",
+                    }
+                ],
+            }
 
-        ext = info.get("ext", "mp4")
-        filepath = os.path.join(DOWNLOAD_DIR, f"{job_id}.{ext}")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
 
-        jobs[job_id].update({
-            "status": "done",
-            "filename": f"{job_id}.{ext}",
-            "filepath": filepath,
-            "title": info.get("title", ""),
-            "thumbnail": extract_thumbnail(info),
-        })
+            # File dhundho
+            filepath = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp4")
+            if not os.path.exists(filepath):
+                actual_ext = info.get("ext", "mp4")
+                filepath = os.path.join(DOWNLOAD_DIR, f"{job_id}.{actual_ext}")
 
-    except Exception as e:
-        jobs[job_id].update({
-            "status": "error",
-            "error": str(e),
-        })
+            if not os.path.exists(filepath):
+                raise FileNotFoundError(f"File nahi mili: {filepath}")
+
+            jobs[job_id].update({
+                "status": "done",
+                "filename": os.path.basename(filepath),
+                "filepath": filepath,
+                "title": info.get("title", ""),
+                "thumbnail": extract_thumbnail(info),
+                "format_used": fmt,
+                "filesize": os.path.getsize(filepath),
+            })
+            return  # success, bahar aa jao
+
+        except Exception as e:
+            last_error = str(e)
+            # Partial files cleanup karo
+            for ext in ["mp4", "m4a", "webm", "mkv", "part"]:
+                f = os.path.join(DOWNLOAD_DIR, f"{job_id}.{ext}")
+                if os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except:
+                        pass
+            continue
+
+    # Sab formats fail ho gaye
+    jobs[job_id].update({
+        "status": "error",
+        "error": last_error,
+    })
+    # Cache se hata do taaki user retry kar sake
+    with url_cache_lock:
+        bad_keys = [k for k, v in url_cache.items() if v == job_id]
+        for k in bad_keys:
+            del url_cache[k]
+
+
+def get_or_create_job(url: str) -> str:
+    """Same URL ke liye existing job return karo, naya ho to banao."""
+    with url_cache_lock:
+        if url in url_cache:
+            existing_id = url_cache[url]
+            if existing_id in jobs and jobs[existing_id]["status"] != "error":
+                return existing_id
+
+        job_id = str(uuid.uuid4())
+        jobs[job_id] = {"status": "queued", "created_at": time.time()}
+        url_cache[url] = job_id
+
+    threading.Thread(
+        target=merge_and_cache,
+        args=(job_id, url),
+        daemon=True
+    ).start()
+
+    return job_id
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -103,17 +164,22 @@ def download_reel(job_id: str, url: str):
 @app.route("/")
 def index():
     return jsonify({
-        "message": "Reel API (Download + Stream)",
+        "message": "Reel API — Server-side merge (Audio Fixed 🔥)",
+        "how_it_works": [
+            "1. POST /info with url",
+            "2. Poll GET /status/<job_id> jab tak status=done",
+            "3. stream_url ya download_url use karo",
+        ],
         "endpoints": {
-            "/info": "Get thumbnail + stream URL",
-            "/stream": "Proxy stream video",
-            "/download": "Download video (optional)",
-            "/status/<job_id>": "Check download status",
+            "POST /info": "Metadata + job shuru karo",
+            "GET  /status/<job_id>": "Processing status",
+            "GET  /stream/<job_id>": "Merged video stream karo",
+            "GET  /file/<filename>": "Download karo",
         }
     })
 
 
-# ─── INFO (FIXED 🔥) ─────────────────────────────────────────────────
+# ─── INFO ────────────────────────────────────────────────────────────
 @app.route("/info", methods=["POST"])
 def get_info():
     data = request.get_json(force=True)
@@ -122,81 +188,112 @@ def get_info():
     if not url:
         return jsonify({"error": "url required"}), 400
 
+    # Quick metadata (no download)
+    title, duration, thumbnail = "", None, ""
     try:
-        with yt_dlp.YoutubeDL({
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-        }) as ydl:
-            info = ydl.extract_info(url, download=False)
+        with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True}) as ydl:
+            meta = ydl.extract_info(url, download=False)
+        title = meta.get("title", "")
+        duration = meta.get("duration")
+        thumbnail = extract_thumbnail(meta)
+    except Exception:
+        pass
 
-        video_url = extract_video_url(info)
+    # Background merge shuru karo
+    job_id = get_or_create_job(url)
+    base_url = request.host_url.rstrip("/")
 
-        # 🔥 IMPORTANT: encode URL
-        encoded_url = urllib.parse.quote(video_url, safe='')
+    return jsonify({
+        "job_id": job_id,
+        "title": title,
+        "duration": duration,
+        "thumbnail": thumbnail,
+        "stream_url": f"{base_url}/stream/{job_id}",
+        "status_url": f"{base_url}/status/{job_id}",
+        "note": "status_url poll karo — jab status=done ho tab stream_url use karo",
+    })
 
-        base_url = request.host_url.rstrip("/")
 
+# ─── STREAM — Merged file range-aware serve ───────────────────────────
+@app.route("/stream/<job_id>")
+def stream_video(job_id):
+    job = jobs.get(job_id)
+
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+
+    if job["status"] == "error":
+        return jsonify({"error": job.get("error", "Processing failed")}), 500
+
+    if job["status"] != "done":
         return jsonify({
-            "title": info.get("title", ""),
-            "duration": info.get("duration"),
-            "thumbnail": extract_thumbnail(info),
-            "video_url": f"{base_url}/stream?url={encoded_url}"
-        })
+            "error": "Abhi processing ho rahi hai, thoda wait karo",
+            "status": job["status"],
+        }), 202
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    filepath = job.get("filepath")
+    if not filepath or not os.path.exists(filepath):
+        return jsonify({"error": "File nahi mili server pe"}), 404
 
+    filesize = os.path.getsize(filepath)
+    range_header = request.headers.get("Range")
 
-# ─── STREAM (FIXED 🔥) ───────────────────────────────────────────────
-@app.route("/stream")
-def stream_video():
-    encoded_url = request.args.get("url")
+    if range_header:
+        # Seeking support ke liye Range request handle karo
+        byte_start, byte_end = 0, filesize - 1
+        match = range_header.replace("bytes=", "").split("-")
+        if match[0]:
+            byte_start = int(match[0])
+        if len(match) > 1 and match[1]:
+            byte_end = int(match[1])
 
-    if not encoded_url:
-        return "Missing url", 400
+        length = byte_end - byte_start + 1
 
-    try:
-        # 🔥 decode URL
-        url = urllib.parse.unquote(encoded_url)
-
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://www.instagram.com/"
-        }
-
-        r = requests.get(url, headers=headers, stream=True)
+        def generate_range():
+            with open(filepath, "rb") as f:
+                f.seek(byte_start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(8192, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
 
         return Response(
-            r.iter_content(chunk_size=1024),
-            content_type=r.headers.get("content-type", "video/mp4"),
+            generate_range(),
+            status=206,
+            headers={
+                "Content-Type": "video/mp4",
+                "Accept-Ranges": "bytes",
+                "Content-Range": f"bytes {byte_start}-{byte_end}/{filesize}",
+                "Content-Length": str(length),
+                "Content-Disposition": f'inline; filename="{job.get("filename", "video.mp4")}"',
+            }
         )
 
-    except Exception as e:
-        return str(e), 500
+    # Full file serve
+    def generate_full():
+        with open(filepath, "rb") as f:
+            while True:
+                chunk = f.read(8192)
+                if not chunk:
+                    break
+                yield chunk
+
+    return Response(
+        generate_full(),
+        status=200,
+        headers={
+            "Content-Type": "video/mp4",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(filesize),
+            "Content-Disposition": f'inline; filename="{job.get("filename", "video.mp4")}"',
+        }
+    )
 
 
-# ─── DOWNLOAD ────────────────────────────────────────────────────────
-@app.route("/download", methods=["POST"])
-def start_download():
-    data = request.get_json(force=True)
-    url = (data or {}).get("url", "").strip()
-
-    if not url:
-        return jsonify({"error": "url required"}), 400
-
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "queued", "created_at": time.time()}
-
-    threading.Thread(
-        target=download_reel,
-        args=(job_id, url),
-        daemon=True
-    ).start()
-
-    return jsonify({"job_id": job_id})
-
-
+# ─── STATUS ──────────────────────────────────────────────────────────
 @app.route("/status/<job_id>")
 def get_status(job_id):
     job = jobs.get(job_id)
@@ -209,14 +306,39 @@ def get_status(job_id):
     if job["status"] == "done":
         return jsonify({
             "status": "done",
+            "stream_url": f"{base_url}/stream/{job_id}",
             "download_url": f"{base_url}/file/{job['filename']}",
             "title": job.get("title"),
             "thumbnail": job.get("thumbnail"),
+            "filesize": job.get("filesize"),
+            "format_used": job.get("format_used"),
         })
 
-    return jsonify(job)
+    return jsonify({
+        "status": job["status"],
+        "error": job.get("error"),
+    })
 
 
+# ─── DOWNLOAD trigger (same as /info without metadata) ───────────────
+@app.route("/download", methods=["POST"])
+def start_download():
+    data = request.get_json(force=True)
+    url = (data or {}).get("url", "").strip()
+
+    if not url:
+        return jsonify({"error": "url required"}), 400
+
+    job_id = get_or_create_job(url)
+    base_url = request.host_url.rstrip("/")
+
+    return jsonify({
+        "job_id": job_id,
+        "status_url": f"{base_url}/status/{job_id}",
+    })
+
+
+# ─── SERVE FILE ──────────────────────────────────────────────────────
 @app.route("/file/<filename>")
 def serve_file(filename):
     return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
