@@ -1,16 +1,11 @@
-services:
-  - type: web
-    name: insta-reel-downloader
-    env: python
-    plan: free
+FROM python:3.12-slim
 
-    buildCommand: |
-      apt-get update
-      apt-get install -y ffmpeg
-      pip install -r requirements.txt
+RUN apt-get update && apt-get install -y ffmpeg
 
-    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+WORKDIR /app
 
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
+COPY . .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+CMD ["gunicorn", "App:app", "--workers", "1", "--threads", "4", "--timeout", "120", "--bind", "0.0.0.0:10000"]
